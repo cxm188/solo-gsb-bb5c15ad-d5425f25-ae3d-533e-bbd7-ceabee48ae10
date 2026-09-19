@@ -94,6 +94,157 @@ def test_top_n_bounds(client):
     assert resp.status_code == 422
 
 
+def test_ion_envelope_protonated_glucose(client):
+    resp = client.post(
+        "/api/v1/ion-envelope",
+        json={"formula": "C6H12O6", "adduct": "+H", "charge": 1, "top_n": 5},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["formula"] == "C6H12O6"
+    assert body["adduct"] == "+H"
+    assert body["charge"] == 1
+    assert body["composition"] == {"C": 6, "H": 13, "O": 6}
+    assert body["labels"] == {}
+    # (180.063388 + 1.007825) - m_e = 181.070665
+    assert body["monoisotopic_mz"] == pytest.approx(181.070665, abs=1e-6)
+    assert body["peak_count"] == 5
+    assert len(body["peaks"]) == 5
+    assert max(p["intensity"] for p in body["peaks"]) == pytest.approx(100.0)
+    mzs = [p["mz"] for p in body["peaks"]]
+    assert mzs == sorted(mzs)
+    assert mzs[0] == pytest.approx(181.070665, abs=1e-5)
+    # singly charged isotope peaks sit ~1.0034 m/z apart
+    assert mzs[1] - mzs[0] == pytest.approx(1.003355, abs=1e-4)
+
+
+def test_ion_envelope_multiply_charged_halves_mz_spacing(client):
+    resp = client.post(
+        "/api/v1/ion-envelope",
+        json={"formula": "C6H12O6", "adduct": "+2H", "charge": 2, "top_n": 5},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["composition"] == {"C": 6, "H": 14, "O": 6}
+    assert body["monoisotopic_mz"] == pytest.approx(91.038971, abs=1e-6)
+    mzs = [p["mz"] for p in body["peaks"]]
+    # doubly charged: isotope spacing on the m/z axis is ~0.5017
+    assert mzs[1] - mzs[0] == pytest.approx(0.501677, abs=1e-4)
+
+
+def test_ion_envelope_negative_charge_adds_electron_mass(client):
+    resp = client.post(
+        "/api/v1/ion-envelope",
+        json={"formula": "H2O", "adduct": "-H", "charge": -1, "top_n": 3},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["composition"] == {"H": 1, "O": 1}
+    # m/z = M(OH) - z*m_e = 1.007825 + 15.994915 + m_e = 17.003288
+    assert body["monoisotopic_mz"] == pytest.approx(17.003288, abs=1e-6)
+
+
+def test_ion_envelope_complex_adduct_with_coefficient(client):
+    resp = client.post(
+        "/api/v1/ion-envelope",
+        json={"formula": "C6H12O6", "adduct": "+2H-H2O", "charge": 1, "top_n": 3},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["composition"] == {"C": 6, "H": 12, "O": 5}
+
+
+def test_ion_envelope_sodium_adduct(client):
+    resp = client.post(
+        "/api/v1/ion-envelope",
+        json={"formula": "CH4O", "adduct": "+Na-H", "charge": 1, "top_n": 3},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["composition"] == {"C": 1, "H": 3, "O": 1, "Na": 1}
+    # monoisotopic: 12 + 3*1.007825 + 15.994915 + 22.989769 - m_e
+    expected = 12 + 3 * 1.00782503223 + 15.99491461957 + 22.989769282 - 0.000548579909065
+    assert body["monoisotopic_mz"] == pytest.approx(expected, abs=1e-6)
+
+
+def test_ion_envelope_preserves_labels(client):
+    resp = client.post(
+        "/api/v1/ion-envelope",
+        json={"formula": "C6H6[13C]2", "adduct": "+H", "charge": 1, "top_n": 3},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["composition"] == {"C": 6, "H": 7}
+    assert body["labels"] == {"[13C]": 2}
+    neutral = 6 * 12.0 + 7 * 1.00782503223 + 2 * 13.00335483507
+    assert body["monoisotopic_mz"] == pytest.approx(neutral - 0.00054858, abs=1e-5)
+
+
+def test_ion_envelope_negative_count_adduct_422(client):
+    resp = client.post(
+        "/api/v1/ion-envelope",
+        json={"formula": "C6H12O6", "adduct": "+H-H20", "charge": 1},
+    )
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["error"] == "invalid_adduct"
+    assert detail["position"] == 2
+    assert "negative" in detail["message"]
+
+
+def test_ion_envelope_malformed_adduct_422(client):
+    for adduct, position in [("H", 0), ("", 0), ("+-H", 0), ("+Xx", 1), ("+2", 1)]:
+        resp = client.post(
+            "/api/v1/ion-envelope",
+            json={"formula": "H2O", "adduct": adduct, "charge": 1},
+        )
+        assert resp.status_code == 422, adduct
+        detail = resp.json()["detail"]
+        assert detail["error"] == "invalid_adduct"
+        assert detail["position"] == position
+
+
+def test_ion_envelope_invalid_formula_422(client):
+    resp = client.post(
+        "/api/v1/ion-envelope",
+        json={"formula": "C6Xx2", "adduct": "+H", "charge": 1},
+    )
+    assert resp.status_code == 422
+    assert resp.json()["detail"]["error"] == "invalid_formula"
+
+
+def test_ion_envelope_charge_bounds(client):
+    payload = {"formula": "H2O", "adduct": "+H"}
+    for charge in (0, 11, -11):
+        resp = client.post(
+            "/api/v1/ion-envelope", json={**payload, "charge": charge}
+        )
+        assert resp.status_code == 422, charge
+    for charge in (-10, -1, 1, 10):
+        adduct = "+2H" if charge in (10, -10) else "+H"
+        resp = client.post(
+            "/api/v1/ion-envelope",
+            json={**payload, "adduct": adduct, "charge": charge},
+        )
+        assert resp.status_code == 200, charge
+
+
+def test_ion_envelope_top_n_bounds(client):
+    base = {"formula": "H2O", "adduct": "+H", "charge": 1}
+    resp = client.post("/api/v1/ion-envelope", json={**base, "top_n": 0})
+    assert resp.status_code == 422
+    resp = client.post(
+        "/api/v1/ion-envelope", json={**base, "top_n": settings.top_n_max + 1}
+    )
+    assert resp.status_code == 422
+
+
+def test_ion_envelope_missing_fields(client):
+    resp = client.post("/api/v1/ion-envelope", json={"formula": "H2O"})
+    assert resp.status_code == 422
+
+
+
 def test_missing_formula(client):
     resp = client.post("/api/v1/envelope", json={})
     assert resp.status_code == 422

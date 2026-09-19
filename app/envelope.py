@@ -14,6 +14,10 @@ from .parser import ParsedFormula
 
 Peak = tuple[float, float]  # (mass Da, probability/intensity)
 
+# Electron mass in daltons; an ion of charge z (signed) has mass
+# neutral_mass - z * ELECTRON_MASS, i.e. m/z = (M - z*m_e) / |z|.
+ELECTRON_MASS_DA = 0.000548579909065
+
 
 def merge_peaks(peaks: list[Peak], tolerance: float) -> list[Peak]:
     """Merge peaks whose mass difference is below ``tolerance`` Da.
@@ -108,3 +112,40 @@ def top_peaks(envelope: list[Peak], top_n: int) -> list[Peak]:
     normalised = [(m, 100.0 * i / base) for m, i in envelope]
     strongest = sorted(normalised, key=lambda p: p[1], reverse=True)[:top_n]
     return sorted(strongest)
+
+
+def ion_envelope(
+    composition: dict[str, int],
+    labels: dict[tuple[str, int], int],
+    charge: int,
+    merge_tolerance: float,
+    prune: float,
+) -> list[Peak]:
+    """Isotope envelope of an ion, returned as (m/z, probability) peaks.
+
+    The natural-abundance envelope is convolved with the existing machinery
+    and then merged at ``|charge| * merge_tolerance`` Da (neutral mass),
+    which is the resolution relevant once the m/z axis is divided by
+    ``|charge|``. Peaks are finally mapped to m/z via
+    ``(mass - charge * m_e) / |charge|``.
+    """
+    parsed = ParsedFormula(composition=dict(composition), labels=dict(labels))
+    envelope = isotope_envelope(parsed, merge_tolerance, prune)
+    scaled_tolerance = abs(charge) * merge_tolerance
+    merged = merge_peaks(envelope, scaled_tolerance)
+    return [
+        ((m - charge * ELECTRON_MASS_DA) / abs(charge), i) for m, i in merged
+    ]
+
+
+def ion_monoisotopic_mz(
+    composition: dict[str, int],
+    labels: dict[tuple[str, int], int],
+    charge: int,
+) -> float:
+    """Monoisotopic m/z of an ion: ``(M - charge * m_e) / |charge|`` where M
+    is the neutral monoisotopic mass of the adduct-adjusted composition."""
+    parsed = ParsedFormula(composition=dict(composition), labels=dict(labels))
+    neutral = monoisotopic_mass(parsed)
+    return (neutral - charge * ELECTRON_MASS_DA) / abs(charge)
+
