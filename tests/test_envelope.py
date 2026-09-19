@@ -1,7 +1,10 @@
 import pytest
 
 from app.envelope import (
+    ELECTRON_MASS_DA,
+    ion_envelope,
     isotope_envelope,
+    mass_to_mz,
     merge_peaks,
     monoisotopic_mass,
     top_peaks,
@@ -83,3 +86,25 @@ def test_single_element_envelope_matches_abundances():
     masses = {round(m, 6): i for m, i in env}
     assert masses[round(34.968852682, 6)] == pytest.approx(0.7576)
     assert masses[round(36.965902602, 6)] == pytest.approx(0.2424)
+
+
+def test_mass_to_mz_positive_charge_removes_electrons():
+    # singly charged: (M - m_e) / 1
+    assert mass_to_mz(100.0, 1) == pytest.approx(100.0 - ELECTRON_MASS_DA)
+    # doubly charged: (M - 2 * m_e) / 2
+    assert mass_to_mz(100.0, 2) == pytest.approx(50.0 - ELECTRON_MASS_DA)
+
+
+def test_mass_to_mz_negative_charge_adds_electrons():
+    # singly negative: (M - (-1) * m_e) / 1 = M + m_e
+    assert mass_to_mz(100.0, -1) == pytest.approx(100.0 + ELECTRON_MASS_DA)
+    assert mass_to_mz(100.0, -2) == pytest.approx(50.0 + ELECTRON_MASS_DA)
+
+
+def test_ion_envelope_preserves_order_and_intensity():
+    env = [(18.0, 0.9), (19.0, 0.1)]
+    mz_peaks = ion_envelope(env, 2)
+    assert [i for _, i in mz_peaks] == [0.9, 0.1]
+    assert mz_peaks[0][0] == pytest.approx(mass_to_mz(18.0, 2))
+    assert mz_peaks[1][0] == pytest.approx(mass_to_mz(19.0, 2))
+    assert mz_peaks[1][0] > mz_peaks[0][0]

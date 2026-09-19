@@ -6,9 +6,10 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from . import __version__, db
+from .adduct import AdductError, apply_adduct, parse_adduct
 from .config import settings
 from .enrichment import (
     LabelCombinationError,
@@ -18,7 +19,13 @@ from .enrichment import (
     normalise_base_peak,
     validate_observed_peaks,
 )
-from .envelope import isotope_envelope, monoisotopic_mass, top_peaks
+from .envelope import (
+    ELECTRON_MASS_DA,
+    ion_envelope,
+    isotope_envelope,
+    monoisotopic_mass,
+    top_peaks,
+)
 from .isotopes import ISOTOPES
 from .parser import FormulaError, LabelError, parse_formula, parse_label
 
@@ -75,6 +82,60 @@ class EnvelopeResponse(BaseModel):
     peak_count: int
     peaks: list[PeakOut]
     cached: bool
+
+
+class IonEnvelopeRequest(BaseModel):
+    formula: str = Field(
+        ...,
+        description="Neutral molecular formula, e.g. 'C6H12O6' or 'C6H6[13C]2'",
+        examples=["C6H12O6"],
+    )
+    adduct: str = Field(
+        ...,
+        description=(
+            "Adduct made of consecutive '+/-[coefficient]formula' fragments; "
+            "the coefficient multiplies the whole fragment, e.g. '+H', "
+            "'+2H-H2O' or '+Na-H'"
+        ),
+        examples=["+H"],
+    )
+    charge: int = Field(
+        ...,
+        ge=-10,
+        le=10,
+        description="Signed ion charge; must be -10..-1 or 1..10 (zero is not allowed)",
+        examples=[1],
+    )
+    top_n: int = Field(
+        settings.top_n_default,
+        ge=1,
+        le=settings.top_n_max,
+        description="Number of most intense peaks to return",
+    )
+
+    @field_validator("charge")
+    @classmethod
+    def charge_must_be_nonzero(cls, value: int) -> int:
+        if value == 0:
+            raise ValueError("charge must be non-zero: use -10..-1 or 1..10")
+        return value
+
+
+class MzPeakOut(BaseModel):
+    mz: float
+    intensity: float
+
+
+class IonEnvelopeResponse(BaseModel):
+    formula: str
+    adduct: str
+    charge: int
+    composition: dict[str, int]
+    labels: dict[str, int]
+    monoisotopic_mz: float
+    base_peak_intensity: float
+    peak_count: int
+    peaks: list[MzPeakOut]
 
 
 class ObservedPeak(BaseModel):
@@ -195,6 +256,20 @@ async def formula_error_handler(request: Request, exc: FormulaError) -> JSONResp
     )
 
 
+@app.exception_handler(AdductError)
+async def adduct_error_handler(request: Request, exc: AdductError) -> JSONResponse:
+    return JSONResponse(
+        status_code=422,
+        content={
+            "detail": {
+                "error": "invalid_adduct",
+                "message": exc.message,
+                "position": exc.position,
+            }
+        },
+    )
+
+
 @app.exception_handler(LabelError)
 async def label_error_handler(request: Request, exc: LabelError) -> JSONResponse:
     return JSONResponse(
@@ -283,6 +358,53 @@ def envelope(req: EnvelopeRequest) -> dict:
     }
     db.put_cache(req.formula, req.top_n, {k: v for k, v in result.items() if k != "cached"})
     db.log_request(req.formula, req.top_n, ok=True, message="computed")
+    return result
+
+
+@app.post("/api/v1/ion-envelope", response_model=IonEnvelopeResponse)
+def ion_envelope_endpoint(req: IonEnvelopeRequest) -> dict:
+    """Compute the adducted ion isotope envelope as m/z peaks.
+
+    The neutral formula is parsed, the adduct fragments are applied to the
+    atom counts, and the envelope is convolved with the neutral peak merge
+    tolerance scaled by |charge|; ionic masses are then converted to m/z via
+    ``(mass - charge * m_e) / |charge|``.
+    """
+    try:
+        parsed = parse_formula(req.formula)
+        pieces = parse_adduct(req.adduct)
+        adjusted = apply_adduct(parsed, pieces)
+    except (FormulaError, AdductError) as exc:
+        db.log_request(req.formula, req.top_n, ok=False, message=exc.message)
+        raise
+
+    # Larger charge states spread isotope peaks more tightly in m/z, so the
+    # neutral-mass merge tolerance scales with |charge| before conversion.
+    merge_tolerance = abs(req.charge) * settings.merge_tolerance
+    env = isotope_envelope(adjusted, merge_tolerance, settings.prune_threshold)
+    peaks = top_peaks(env, req.top_n)
+    mz_peaks = ion_envelope(peaks, req.charge)
+    mono_mz = (
+        monoisotopic_mass(adjusted) - req.charge * ELECTRON_MASS_DA
+    ) / abs(req.charge)
+
+    result = {
+        "formula": req.formula,
+        "adduct": req.adduct,
+        "charge": req.charge,
+        "composition": adjusted.composition,
+        "labels": {
+            f"[{mass_no}{symbol}]": count
+            for (symbol, mass_no), count in adjusted.labels.items()
+        },
+        "monoisotopic_mz": round(mono_mz, 6),
+        "base_peak_intensity": 100.0,
+        "peak_count": len(mz_peaks),
+        "peaks": [
+            {"mz": round(mz, 6), "intensity": round(i, 6)} for mz, i in mz_peaks
+        ],
+    }
+    db.log_request(req.formula, req.top_n, ok=True, message="ion envelope computed")
     return result
 
 

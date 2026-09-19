@@ -14,6 +14,9 @@ from .parser import ParsedFormula
 
 Peak = tuple[float, float]  # (mass Da, probability/intensity)
 
+# Electron rest mass in daltons, used when converting ionic mass to m/z.
+ELECTRON_MASS_DA = 0.000548579909065
+
 
 def merge_peaks(peaks: list[Peak], tolerance: float) -> list[Peak]:
     """Merge peaks whose mass difference is below ``tolerance`` Da.
@@ -108,3 +111,20 @@ def top_peaks(envelope: list[Peak], top_n: int) -> list[Peak]:
     normalised = [(m, 100.0 * i / base) for m, i in envelope]
     strongest = sorted(normalised, key=lambda p: p[1], reverse=True)[:top_n]
     return sorted(strongest)
+
+
+def mass_to_mz(mass: float, charge: int) -> float:
+    """Convert an ionic mass (Da) to m/z for an ion with the given charge.
+
+    A positive charge z corresponds to removing z electrons, so the ion mass
+    is ``neutral_mass - z * m_e``; a negative charge adds ``|z|`` electrons.
+    The m/z is then that ionic mass divided by ``|z|``.
+    """
+    return (mass - charge * ELECTRON_MASS_DA) / abs(charge)
+
+
+def ion_envelope(envelope: list[Peak], charge: int) -> list[Peak]:
+    """Map a neutral/ionic mass peak list to (m/z, intensity) via
+    :func:`mass_to_mz`. Division by the positive ``|charge|`` is strictly
+    monotonic, so peak order and distinctness are preserved."""
+    return [(mass_to_mz(m, charge), i) for m, i in envelope]
